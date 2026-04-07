@@ -1,0 +1,14 @@
+# Core deep learning stack — pinned to versions tested on Windows + CUDA 12.1
+# Install torch separately via the instructions in SETUP.md (needs the CUDA index URL)
+
+transformers>=4.40.0,<5.0.0     # For CLIP text encoder (HuggingFace)
+numpy>=1.24.0                   # torch 2.5+ installs numpy 2.x automatically
+pandas>=2.0.0                   # For CSV reading
+tqdm>=4.65.0                    # Progress bars
+tensorboard>=2.15.0             # Training loss curves
+einops>=0.7.0                   # Cleaner tensor reshaping
+matplotlib>=3.7.0               # For quick visualization of generated sequences
+
+# Real-time sidecar server (serves curves over HTTP to Unreal)
+fastapi>=0.100                  # HTTP API framework
+uvicorn>=0.24                   # ASGI server

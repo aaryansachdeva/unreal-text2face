@@ -1,0 +1,34 @@
+# Model weights (must be trained by the user)
+checkpoints/
+*.pt
+*.onnx
+
+# Dataset (must be downloaded separately)
+ExpressData/
+
+# Training artifacts
+runs/
+outputs/
+training_*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# Unreal build artifacts (if testing in-project)
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+.vs/
+*.sln
