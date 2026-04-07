@@ -1,4 +1,6 @@
-# TextToFace
+# Text2Face
+
+[![Demo](https://img.youtube.com/vi/tHJkFvBXtaU/maxresdefault.jpg)](https://youtu.be/tHJkFvBXtaU)
 
 Real-time text-driven facial animation for Unreal Engine MetaHumans. Type a stage direction like *"A person looks surprised"* and watch a MetaHuman's face animate in real-time.
 
@@ -35,7 +37,7 @@ Text Prompt ──> Python Server (30ms) ──> HTTP ──> UE Component ─�
 TextToFace/
   python/                    # Python model + sidecar server
     src/
-      model.py               # TextToFace transformer architecture
+      model.py               # Text2Face transformer architecture
       train.py               # Training loop (weighted channel loss)
       server.py              # FastAPI sidecar (HTTP API for Unreal)
       mh_mapping.py          # ARKit -> MetaHuman curve name mapping
