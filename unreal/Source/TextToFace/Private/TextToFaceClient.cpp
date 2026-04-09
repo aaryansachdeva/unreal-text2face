@@ -66,8 +66,12 @@ void UTextToFaceClient::PushLiveLinkFrame()
 
 	if (FrameF >= (double)LastFrame)
 	{
-		// Past the end — hold last frame
-		Values = CurrentBlock.ARKitFrames[LastFrame];
+		// Clip finished — push zeros to clear additive layer, then stop
+		StartTimeSeconds = -1.0;
+		TArray<float> Zeros;
+		Zeros.SetNumZeroed(NumProps);
+		LiveLinkSource->PushFrameData(Zeros);
+		return;
 	}
 	else
 	{

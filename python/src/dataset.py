@@ -87,6 +87,9 @@ SOURCE_FPS = 60
 #   HeadYaw, HeadRoll
 
 def _build_mirror_table() -> Tuple[np.ndarray, np.ndarray]:
+    """Smart mirror (v8): swap Left/Right EXPRESSION channels only.
+    Head rotation (52-54) and eye rotation (55-60) are LEFT UNTOUCHED
+    so the model preserves natural head movement patterns."""
     name_to_idx = {n: i for i, n in enumerate(CHANNEL_NAMES)}
     perm = list(range(N_CHANNELS))
     sign = np.ones(N_CHANNELS, dtype=np.float32)
@@ -95,29 +98,25 @@ def _build_mirror_table() -> Tuple[np.ndarray, np.ndarray]:
         i, j = name_to_idx[a], name_to_idx[b]
         perm[i], perm[j] = j, i
 
-    # Channels whose name contains "Left" and have a "Right" counterpart
+    # Swap Left/Right expression blendshapes (indices 0-51 only)
+    # Skip LeftEye*/RightEye* rotation channels (55-60)
+    rotation_names = {"LeftEyeYaw", "LeftEyePitch", "LeftEyeRoll",
+                      "RightEyeYaw", "RightEyePitch", "RightEyeRoll"}
     for name in list(name_to_idx.keys()):
+        if name in rotation_names:
+            continue  # don't touch eye rotations
         if "Left" in name:
             mirrored = name.replace("Left", "Right")
-            if mirrored in name_to_idx and name_to_idx[name] < name_to_idx[mirrored]:
-                swap(name, mirrored)
+            if mirrored in name_to_idx and mirrored not in rotation_names:
+                if name_to_idx[name] < name_to_idx[mirrored]:
+                    swap(name, mirrored)
 
-    # Non-suffix spatial pairs
+    # Non-suffix spatial pairs (expressions only)
     swap("JawLeft", "JawRight")
     swap("MouthLeft", "MouthRight")
 
-    # Sign flips
-    for name in ("HeadYaw", "HeadRoll"):
-        sign[name_to_idx[name]] = -1.0
-
-    # LeftEye*/RightEye* rotation channels:
-    # - *Yaw: swap AND negate (horizontal direction)
-    # - *Pitch: swap only (unchanged by horizontal mirror)
-    # - *Roll: swap AND negate
-    # Swaps were already performed above via the "Left"/"Right" loop
-    # (LeftEyeYaw <-> RightEyeYaw, etc.), so here we just set signs.
-    for name in ("LeftEyeYaw", "RightEyeYaw", "LeftEyeRoll", "RightEyeRoll"):
-        sign[name_to_idx[name]] = -1.0
+    # NO sign flips on HeadYaw/HeadRoll — leave head rotation as-is
+    # NO swaps or sign flips on eye rotations — leave as-is
 
     return np.asarray(perm, dtype=np.int64), sign
 
@@ -126,18 +125,10 @@ MIRROR_PERM, MIRROR_SIGN = _build_mirror_table()
 
 
 def mirror_motion(x: np.ndarray) -> np.ndarray:
-    """Apply horizontal mirror to a [T, 61] motion array in native (un-normalized) space.
-
-    Returned array is a new [T, 61] float32 with channels permuted and
-    sign-flipped where appropriate. Safe to apply before or after
-    normalization as long as the dataset mean/std are themselves symmetric
-    (which they approximately are since the training set contains roughly
-    equal amounts of left-leaning and right-leaning expressions).
-
-    NOTE: applying this in un-normalized space then re-normalizing is
-    the most robust path and is what the dataset class does.
+    """Smart mirror: swap Left/Right expression blendshapes but preserve
+    head and eye rotation channels unchanged. This gives L/R symmetry
+    for expressions without killing head movement.
     """
-    # x[:, MIRROR_PERM] does fancy indexing along the channel axis
     return (x[:, MIRROR_PERM] * MIRROR_SIGN).astype(np.float32)
 
 

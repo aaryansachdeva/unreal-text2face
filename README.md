@@ -150,9 +150,50 @@ For interactive testing, create a UMG widget with a text box and button that cal
 ```
 GET  /health              → server status
 POST /generate            → generate expression curves
-  body: { "prompt": "A person looks surprised", "frames": 240, "fps": 60 }
-  response: { "arkit_raw": { "EyeBlinkLeft": [...], "HeadYaw": [...], ... }, ... }
+  body: {
+    "prompt": "A person looks surprised",
+    "frames": 240,
+    "fps": 60,
+    "guidance": 1.5,
+    "smooth_window": 5
+  }
+  response: {
+    "arkit_raw": { "EyeBlinkLeft": [...], "HeadYaw": [...], ... },
+    "curves": { "ctrl_expressions_jawopen": [...], ... },
+    ...
+  }
 ```
+
+#### Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `prompt` | (required) | Stage-direction text |
+| `frames` | 240 | Number of output frames |
+| `fps` | 60 | Output frame rate |
+| `guidance` | 1.5 | CFG scale. 1.0=off, 1.5=moderate, 2.0=strong exaggeration |
+| `smooth_window` | 5 | Post-smoothing window (1=off, 5=gentle, 11=heavy) |
+
+#### Classifier-Free Guidance (CFG)
+
+The model supports classifier-free guidance for controlling expression intensity. During training, captions are randomly dropped 10% of the time to train the unconditional path. At inference:
+
+```
+output = unconditional + guidance * (conditional - unconditional)
+```
+
+- `1.0` — no guidance (raw model output)
+- `1.5` — moderate exaggeration (recommended)
+- `2.0` — strong, more dramatic expressions
+- `3.0+` — extreme, may produce artifacts
+
+#### Post-Processing
+
+The server applies several post-processing steps:
+- **Smoothing**: moving average filter to reduce frame-to-frame jitter
+- **Fade-in**: first 30 frames (~0.5s) ramp from zero for smooth blend-in
+- **Fade-out**: last 40 frames (~0.66s) decay to zero for smooth blend-out
+- **Channel amplification**: blinks (10x), eye gaze (3x) to compensate for training data sparsity
 
 ### Blueprint
 
@@ -161,16 +202,18 @@ POST /generate            → generate expression curves
 - `IsPlaying` — check if an animation is currently playing
 - `Stop` — halt playback
 
-## Model Architecture
+## Model Architecture (v8)
 
 Feed-forward transformer conditioned on CLIP text embeddings:
 
 - **Text encoder**: Frozen CLIP ViT-B/32 (63M params)
-- **Projection**: 512 -> latent_dim MLP
-- **Transformer**: Pre-norm encoder (configurable layers/heads/dim)
-- **Output**: latent_dim -> 61 ARKit channels per frame
+- **Projection**: 512 -> 768-dim MLP
+- **Transformer**: 6-layer pre-norm encoder, 12 heads, 2048 ff-dim, 0.25 dropout
+- **Output**: 768-dim -> 61 ARKit channels per frame
+- **EMA**: exponential moving average of weights for smoother inference
+- **Trainable params**: ~48.5M (111.65M total including frozen CLIP)
 
-Loss: Masked L1 + velocity smoothness + acceleration jitter, with per-channel weights boosting blinks (5x), eye gaze (3x), and head rotation (4x).
+Loss: Masked L1 + velocity smoothness + acceleration jitter, with per-channel weights boosting blinks (5x), eye gaze (3x), and head rotation (4x). Trained with 10% caption dropout for classifier-free guidance support.
 
 ## Acknowledgements
 

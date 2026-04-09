@@ -1,27 +1,25 @@
 """
-Training loop for TextToFace (v4).
+Training loop for TextToFace (v5).
 
-Masked L1 reconstruction + masked velocity loss + masked acceleration loss,
-AdamW with cosine LR schedule + warmup, mixed precision, tensorboard logging,
-best-checkpoint saving, EARLY STOPPING.
-
-Typical invocation:
-    python src/train.py
-
-Key differences vs v1:
-    - Max epochs 500 -> 120 (v1 hit its best val at epoch ~33 then
-      regressed for 467 epochs)
-    - Early stopping: halt if val_loss fails to improve for 25 epochs
-    - Weight decay 1e-4 -> 1e-2 (standard transformer value)
-    - Dropout 0.1 -> 0.2
-    - Velocity loss weight 0.5 -> 1.0
-    - Acceleration loss added with weight 0.25
-    - DataLoader worker_init_fn to properly seed numpy per worker
-      (otherwise all workers would draw identical augmentation)
+v5 changes (over v4):
+    - FIX: channel weights now applied to TRAINING loss (v4 bug: only applied
+      to val, so the model never actually learned boosted blink/head channels)
+    - ADD: EMA (exponential moving average) of model weights — smooths training
+      noise, typically 1-3% better at inference. Borrowed from Express4D/MDM.
+    - ADD: blended L1+L2 loss (MSE penalizes peak errors harder, pushes the
+      model to commit to strong expressions instead of hedging)
+    - Batch size 32 -> 64 (we have 10GB VRAM headroom — bigger batch = more
+      stable gradients)
+    - LR 2e-4 -> 1e-4 (bigger model + bigger batch benefits from lower LR,
+      matches Express4D baseline)
+    - Adam beta2 0.99 -> 0.999 (matches Express4D, smoother second moments)
+    - Recalibrated channel weights (less extreme than v4's since they actually
+      affect training now): blink=3x, eye=2x, head=3x, eye_rot=2x, rest=1x
 """
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -43,88 +41,85 @@ from model import TextToFace
 
 
 # ----------------------------------------------------------------------
-# Per-channel loss weights — boost blinks, eye gaze, head rotation
+# Per-channel loss weights
 # ----------------------------------------------------------------------
-# Channel indices (from dataset.py CHANNEL_NAMES):
-#   0: EyeBlinkLeft       7: EyeBlinkRight        (blinks)
-#   1-6: EyeLook/Squint/WideLeft                   (eye expression L)
-#   8-13: EyeLook/Squint/WideRight                 (eye expression R)
-#   52-54: HeadYaw/Pitch/Roll                       (head rotation)
-#   55-60: L/R EyeYaw/Pitch/Roll                    (eye gaze rotation)
 
 def build_channel_weights(n_channels: int = 61) -> torch.Tensor:
-    """Per-channel weight tensor. Higher = model pays more attention."""
+    """Per-channel weight tensor applied to ALL loss terms (train + val)."""
     w = torch.ones(n_channels, dtype=torch.float32)
 
-    # Blinks: very underrepresented, boost hard
-    w[0] = 5.0   # EyeBlinkLeft
-    w[7] = 5.0   # EyeBlinkRight
+    # Blinks: sparse events the model tends to suppress
+    w[0] = 3.0   # EyeBlinkLeft
+    w[7] = 3.0   # EyeBlinkRight
 
-    # Eye expression channels (squint, wide, look directions)
+    # Eye expression channels
     for i in [1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13]:
-        w[i] = 3.0
+        w[i] = 2.0
 
-    # Head rotation
-    w[52] = 4.0  # HeadYaw
-    w[53] = 4.0  # HeadPitch
-    w[54] = 4.0  # HeadRoll
+    # Head rotation — boosted for visible neck movement
+    w[52] = 5.0  # HeadYaw
+    w[53] = 5.0  # HeadPitch
+    w[54] = 5.0  # HeadRoll
 
     # Eye gaze rotations
     for i in [55, 56, 57, 58, 59, 60]:
-        w[i] = 3.0
+        w[i] = 2.0
 
     return w
 
 
 # ----------------------------------------------------------------------
-# Loss functions (with per-channel weights)
+# Loss functions (blended L1 + L2, with per-channel weights)
 # ----------------------------------------------------------------------
 
-def masked_l1(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
-              channel_weights: torch.Tensor | None = None) -> torch.Tensor:
-    """Weighted L1 loss over masked positions.
+def masked_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
+                channel_weights: torch.Tensor, l2_ratio: float = 0.5) -> torch.Tensor:
+    """Blended L1 + L2 reconstruction loss over masked positions.
     pred, target: [B, T, C]
     mask: [B, T] (True = real frame)
-    channel_weights: [C] (optional, default uniform)
+    channel_weights: [C]
+    l2_ratio: blend ratio (0=pure L1, 1=pure L2, 0.5=equal blend)
     """
-    diff = (pred - target).abs()                  # [B, T, C]
-    if channel_weights is not None:
-        diff = diff * channel_weights.unsqueeze(0).unsqueeze(0)  # [1, 1, C]
-    mask_expanded = mask.unsqueeze(-1).float()    # [B, T, 1]
-    loss = (diff * mask_expanded).sum() / (mask_expanded.sum() * pred.shape[-1] + 1e-8)
-    return loss
+    diff = pred - target                              # [B, T, C]
+    l1 = diff.abs()
+    l2 = diff.square()
+    blended = (1 - l2_ratio) * l1 + l2_ratio * l2    # [B, T, C]
+    weighted = blended * channel_weights.unsqueeze(0).unsqueeze(0)
+    mask_f = mask.unsqueeze(-1).float()               # [B, T, 1]
+    return (weighted * mask_f).sum() / (mask_f.sum() * pred.shape[-1] + 1e-8)
 
 
 def masked_velocity(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
-                    channel_weights: torch.Tensor | None = None) -> torch.Tensor:
+                    channel_weights: torch.Tensor) -> torch.Tensor:
     """Weighted L1 on frame-to-frame differences."""
     pred_vel = pred[:, 1:] - pred[:, :-1]
     tgt_vel = target[:, 1:] - target[:, :-1]
     diff = (pred_vel - tgt_vel).abs()
-    if channel_weights is not None:
-        diff = diff * channel_weights.unsqueeze(0).unsqueeze(0)
-
-    valid = (mask[:, 1:] & mask[:, :-1]).float()
-    valid = valid.unsqueeze(-1)
-
-    loss = (diff * valid).sum() / (valid.sum() * pred.shape[-1] + 1e-8)
-    return loss
+    diff = diff * channel_weights.unsqueeze(0).unsqueeze(0)
+    valid = (mask[:, 1:] & mask[:, :-1]).float().unsqueeze(-1)
+    return (diff * valid).sum() / (valid.sum() * pred.shape[-1] + 1e-8)
 
 
 def masked_acceleration(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
-                        channel_weights: torch.Tensor | None = None) -> torch.Tensor:
+                        channel_weights: torch.Tensor) -> torch.Tensor:
     """Weighted L1 on second differences."""
     pred_acc = pred[:, 2:] - 2 * pred[:, 1:-1] + pred[:, :-2]
     tgt_acc = target[:, 2:] - 2 * target[:, 1:-1] + target[:, :-2]
     diff = (pred_acc - tgt_acc).abs()
-    if channel_weights is not None:
-        diff = diff * channel_weights.unsqueeze(0).unsqueeze(0)
+    diff = diff * channel_weights.unsqueeze(0).unsqueeze(0)
+    valid = (mask[:, 2:] & mask[:, 1:-1] & mask[:, :-2]).float().unsqueeze(-1)
+    return (diff * valid).sum() / (valid.sum() * pred.shape[-1] + 1e-8)
 
-    valid = (mask[:, 2:] & mask[:, 1:-1] & mask[:, :-2]).float()
-    valid = valid.unsqueeze(-1)
 
-    loss = (diff * valid).sum() / (valid.sum() * pred.shape[-1] + 1e-8)
-    return loss
+# ----------------------------------------------------------------------
+# EMA (exponential moving average)
+# ----------------------------------------------------------------------
+
+@torch.no_grad()
+def update_ema(ema_model: nn.Module, model: nn.Module, decay: float) -> None:
+    """Update EMA parameters: ema = decay * ema + (1 - decay) * current."""
+    for ema_p, p in zip(ema_model.parameters(), model.parameters()):
+        ema_p.data.mul_(decay).add_(p.data, alpha=1.0 - decay)
 
 
 # ----------------------------------------------------------------------
@@ -137,7 +132,6 @@ def build_scheduler(optimizer, warmup_steps: int, total_steps: int):
             return step / max(1, warmup_steps)
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
-
     return LambdaLR(optimizer, lr_lambda)
 
 
@@ -149,8 +143,6 @@ def train(args):
     os.makedirs(args.ckpt_dir, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
 
-    # Reproducibility knobs (best-effort; full determinism is not a goal
-    # here since we benefit from the stochasticity of augmentation).
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -218,22 +210,30 @@ def train(args):
     n_trainable = model.count_trainable()
     print(f"Trainable params: {n_trainable / 1e6:.2f}M")
 
+    # --- EMA ---
+    ema_model = copy.deepcopy(model)
+    ema_model.eval()
+    for p in ema_model.parameters():
+        p.requires_grad = False
+    print(f"EMA enabled (decay={args.ema_decay})")
+
     # --- Optimizer + schedule ---
     optimizer = AdamW(
         model.trainable_parameters(),
         lr=args.lr,
-        betas=(0.9, 0.99),
+        betas=(0.9, args.adam_beta2),
         weight_decay=args.weight_decay,
     )
 
     steps_per_epoch = len(train_loader)
     total_steps = steps_per_epoch * args.epochs
-    warmup_steps = min(500, max(50, total_steps // 20))  # 5% warmup, capped
+    warmup_steps = min(500, max(50, total_steps // 20))
     scheduler = build_scheduler(optimizer, warmup_steps, total_steps)
 
-    # --- Channel weights ---
+    # --- Channel weights (applied to BOTH train and val) ---
     channel_weights = build_channel_weights().to(device)
-    print(f"Channel weights: blink=5x, eye=3x, head=4x, eye_rot=3x, rest=1x")
+    cw_desc = "blink=3x, eye=2x, head=5x, eye_rot=2x, rest=1x"
+    print(f"Channel weights: {cw_desc}")
 
     # --- Mixed precision ---
     use_amp = (device.type == "cuda") and args.amp
@@ -256,6 +256,7 @@ def train(args):
     print(f"Warmup steps: {warmup_steps}")
     print(f"Early stopping patience: {args.patience} epochs")
     print(f"Mixed precision: {use_amp}")
+    print(f"Loss: {1-args.l2_ratio:.0%} L1 + {args.l2_ratio:.0%} L2")
     print(
         f"Loss weights: recon=1.0  velocity={args.lambda_vel}  "
         f"acceleration={args.lambda_acc}"
@@ -264,7 +265,6 @@ def train(args):
     for epoch in range(args.epochs):
         # ===== train =====
         model.train()
-        # CLIP must stay in eval mode (no dropout / BN stats updates)
         model.clip_text.eval()
 
         epoch_loss = 0.0
@@ -281,9 +281,10 @@ def train(args):
 
             with torch.amp.autocast("cuda", enabled=use_amp):
                 pred = model(texts, n_frames=args.max_frames)
-                recon = masked_l1(pred, motion, mask)
-                vel = masked_velocity(pred, motion, mask)
-                acc = masked_acceleration(pred, motion, mask)
+                recon = masked_loss(pred, motion, mask, channel_weights,
+                                    l2_ratio=args.l2_ratio)
+                vel = masked_velocity(pred, motion, mask, channel_weights)
+                acc = masked_acceleration(pred, motion, mask, channel_weights)
                 loss = recon + args.lambda_vel * vel + args.lambda_acc * acc
 
             scaler.scale(loss).backward()
@@ -294,6 +295,9 @@ def train(args):
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
+
+            # EMA update
+            update_ema(ema_model, model, args.ema_decay)
 
             step += 1
             epoch_loss += loss.item()
@@ -322,8 +326,8 @@ def train(args):
         epoch_vel /= n_train_batches
         epoch_acc /= n_train_batches
 
-        # ===== validation =====
-        model.eval()
+        # ===== validation (using EMA model) =====
+        ema_model.eval()
         val_loss = 0.0
         val_recon = 0.0
         val_vel = 0.0
@@ -336,8 +340,9 @@ def train(args):
                 texts = batch["text"]
 
                 with torch.amp.autocast("cuda", enabled=use_amp):
-                    pred = model(texts, n_frames=args.max_frames)
-                    recon = masked_l1(pred, motion, mask, channel_weights)
+                    pred = ema_model(texts, n_frames=args.max_frames)
+                    recon = masked_loss(pred, motion, mask, channel_weights,
+                                        l2_ratio=args.l2_ratio)
                     vel = masked_velocity(pred, motion, mask, channel_weights)
                     acc = masked_acceleration(pred, motion, mask, channel_weights)
                     loss = recon + args.lambda_vel * vel + args.lambda_acc * acc
@@ -372,6 +377,7 @@ def train(args):
         # ===== checkpointing + early stopping =====
         ckpt_payload = {
             "model": model.state_dict(),
+            "ema_model": ema_model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "epoch": epoch,
@@ -421,21 +427,17 @@ def main():
 
     # Data
     parser.add_argument("--target-fps", type=int, default=30)
-    parser.add_argument("--max-frames", type=int, default=240,
-                        help="240 = 8 seconds at 30fps")
-    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--max-frames", type=int, default=240)
+    parser.add_argument("--num-workers", type=int, default=8)
 
-    # Augmentation (train split only)
-    parser.add_argument("--mirror-prob", type=float, default=0.0,
-                        help="Probability of horizontal mirror per training sample (0=off)")
-    parser.add_argument("--word-drop-prob", type=float, default=0.1,
-                        help="Probability of dropping each non-protected caption word")
-    parser.add_argument("--subwindow-prob", type=float, default=0.3,
-                        help="Probability of variable sub-window crop per training sample")
-    parser.add_argument("--cfg-drop-prob", type=float, default=0.1,
-                        help="Probability of dropping entire caption for classifier-free guidance")
+    # Augmentation
+    parser.add_argument("--mirror-prob", type=float, default=0.5,
+                        help="Smart mirror: swaps L/R expressions only, preserves head rotation")
+    parser.add_argument("--word-drop-prob", type=float, default=0.1)
+    parser.add_argument("--subwindow-prob", type=float, default=0.3)
+    parser.add_argument("--cfg-drop-prob", type=float, default=0.1)
 
-    # Model (v3-large: 6 layers, 768d, 12 heads, 2048 ff = ~48.5M trainable)
+    # Model
     parser.add_argument("--latent-dim", type=int, default=768)
     parser.add_argument("--n-layers", type=int, default=6)
     parser.add_argument("--n-heads", type=int, default=12)
@@ -443,25 +445,23 @@ def main():
     parser.add_argument("--dropout", type=float, default=0.25)
 
     # Training
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--epochs", type=int, default=150,
-                        help="Max epochs. Training usually stops earlier via --patience.")
-    parser.add_argument("--patience", type=int, default=30,
-                        help="Early stopping patience (epochs without val improvement)")
-    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--epochs", type=int, default=3000)
+    parser.add_argument("--patience", type=int, default=30)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--adam-beta2", type=float, default=0.999)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
-    parser.add_argument("--lambda-vel", type=float, default=1.0,
-                        help="Weight on velocity (smoothness) loss")
-    parser.add_argument("--lambda-acc", type=float, default=0.25,
-                        help="Weight on acceleration (jitter) loss")
-    parser.add_argument("--amp", action="store_true", default=True,
-                        help="Use mixed precision")
+    parser.add_argument("--lambda-vel", type=float, default=1.0)
+    parser.add_argument("--lambda-acc", type=float, default=0.25)
+    parser.add_argument("--l2-ratio", type=float, default=0.0,
+                        help="Pure L1 (v8). 0=pure L1, 0.5=L1+L2 blend")
+    parser.add_argument("--ema-decay", type=float, default=0.9999)
+    parser.add_argument("--amp", action="store_true", default=True)
     parser.add_argument("--no-amp", action="store_false", dest="amp")
     parser.add_argument("--seed", type=int, default=42)
 
     # Logging
-    parser.add_argument("--log-every", type=int, default=20,
-                        help="Tensorboard log every N training steps")
+    parser.add_argument("--log-every", type=int, default=10)
 
     args = parser.parse_args()
     train(args)

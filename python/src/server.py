@@ -46,15 +46,16 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from scipy.ndimage import uniform_filter1d
 from mh_mapping import MH_CURVE_NAMES, ARKIT_CURVE_NAMES, arkit_to_mh_curves
+from model import TextToFace
 
-# All 61 ARKit channel names in model output order (same as dataset.py CHANNEL_NAMES)
+# All 61 ARKit channel names in model output order
 CHANNEL_NAMES = list(ARKIT_CURVE_NAMES) + [
     "HeadYaw", "HeadPitch", "HeadRoll",
     "LeftEyeYaw", "LeftEyePitch", "LeftEyeRoll",
     "RightEyeYaw", "RightEyePitch", "RightEyeRoll",
 ]
-from model import TextToFace
 
 
 # =============================================================================
@@ -65,8 +66,10 @@ class GenerateRequest(BaseModel):
     prompt: str = Field(..., description="Stage-direction text")
     frames: int = Field(240, ge=1, le=480, description="Number of output frames")
     fps: int = Field(60, ge=1, le=120, description="Output frame rate")
-    guidance: float = Field(1.0, ge=0.0, le=5.0,
+    guidance: float = Field(1.5, ge=0.0, le=5.0,
                             description="CFG scale. 1.0=off, 1.5=moderate, 2.0=strong exaggeration")
+    smooth_window: int = Field(5, ge=1, le=15,
+                               description="Post-smoothing window size (1=off, 5=gentle, 11=heavy)")
 
 
 class GenerateResponse(BaseModel):
@@ -76,7 +79,7 @@ class GenerateResponse(BaseModel):
     n_frames: int
     generation_ms: float
     curves: dict[str, list[float]]
-    arkit_raw: dict[str, list[float]] = {}  # Raw ARKit channels for LiveLink
+    arkit_raw: dict[str, list[float]] = {}
 
 
 class HealthResponse(BaseModel):
@@ -116,13 +119,16 @@ def load_model(ckpt_path: str, stats_dir: str) -> None:
 
     _model = TextToFace(
         max_frames=_max_frames,
-        latent_dim=saved_args.get("latent_dim", 512),
-        n_layers=saved_args.get("n_layers", 4),
-        n_heads=saved_args.get("n_heads", 8),
-        ff_dim=saved_args.get("ff_dim", 1024),
+        latent_dim=saved_args.get("latent_dim", 768),
+        n_layers=saved_args.get("n_layers", 6),
+        n_heads=saved_args.get("n_heads", 12),
+        ff_dim=saved_args.get("ff_dim", 2048),
         dropout=saved_args.get("dropout", 0.25),
     ).to(_device)
-    _model.load_state_dict(payload["model"])
+    if "ema_model" in payload:
+        _model.load_state_dict(payload["ema_model"])
+    else:
+        _model.load_state_dict(payload["model"])
     _model.eval()
 
     _mean = np.load(Path(stats_dir) / "mean.npy")
@@ -139,7 +145,7 @@ def load_model(ckpt_path: str, stats_dir: str) -> None:
 
 
 def generate_curves(prompt: str, n_frames: int, fps: int,
-                    guidance: float = 1.0) -> dict:
+                    guidance: float = 1.5, smooth_window: int = 5) -> dict:
     """Run inference, map ARKit -> MH curves, return a dict ready to serialize."""
     assert _model is not None and _mean is not None and _std is not None
 
@@ -159,32 +165,70 @@ def generate_curves(prompt: str, n_frames: int, fps: int,
     # channels (52..60) can go outside and that's fine.
     arkit[:, :52] = np.clip(arkit[:, :52], 0.0, 1.0)
 
-    # --- Save raw ARKit values BEFORE amplification (for LiveLink path) ---
-    # The LiveLink AnimBP (ABP_MH_LiveLink) applies its own scaling
-    # (head rotation × 50, pitch × -50), so raw values must be clean.
+    # --- Post-smoothing: moving average to reduce jitter ---
+    if smooth_window > 1 and arkit.shape[0] > smooth_window:
+        arkit = uniform_filter1d(arkit, size=smooth_window, axis=0, mode='nearest')
+        # Re-clip expressions after smoothing
+        arkit[:, :52] = np.clip(arkit[:, :52], 0.0, 1.0)
+
+    # --- Fade from neutral at start of clip ---
+    # Ramp from zero to actual values so the additive layer blends in smoothly
+    FADE_IN_FRAMES = 30  # ~0.5s at 60fps
+    for f in range(min(FADE_IN_FRAMES, arkit.shape[0])):
+        alpha = (f + 1) / FADE_IN_FRAMES
+        arkit[f] *= alpha
+
+    # --- Fade to neutral at end of clip ---
+    # Append frames that smoothly decay all values to zero so the
+    # additive LiveLink layer naturally returns to the base animation.
+    FADE_FRAMES = 40  # ~0.66s at 60fps
+    fade_section = np.zeros((FADE_FRAMES, arkit.shape[1]), dtype=np.float32)
+    last_frame = arkit[-1]
+    for f in range(FADE_FRAMES):
+        alpha = 1.0 - (f + 1) / FADE_FRAMES  # 1.0 → 0.0
+        fade_section[f] = last_frame * alpha
+    arkit = np.concatenate([arkit, fade_section], axis=0)
+    n_frames = arkit.shape[0]  # update frame count
+
+    # Save raw values BEFORE amplification (for LiveLink path)
     arkit_raw_clean = arkit.copy()
 
-    # --- Post-processing: amplify weak channels (for legacy AnimNode path only) ---
-    EXPR_GAIN = {
-        0: 10.0,   # EyeBlinkLeft
-        7: 10.0,   # EyeBlinkRight
-        1: 3.0, 2: 3.0, 3: 3.0, 4: 3.0,    # EyeLook L
-        8: 3.0, 9: 3.0, 10: 3.0, 11: 3.0,  # EyeLook R
+    # --- Post-processing: amplify weak channels ---
+    # The model underproduces blinks, eye gaze, and head rotation because
+    # Express4D training data has sparse/subtle values for these channels.
+    # Amplify them so they're visible on the MetaHuman.
+    CHANNEL_GAIN = {
+        0: 10.0,  # EyeBlinkLeft
+        7: 10.0,  # EyeBlinkRight
+        1: 3.0,   # EyeLookDownLeft
+        2: 3.0,   # EyeLookInLeft
+        3: 3.0,   # EyeLookOutLeft
+        4: 3.0,   # EyeLookUpLeft
+        8: 3.0,   # EyeLookDownRight
+        9: 3.0,   # EyeLookInRight
+        10: 3.0,  # EyeLookOutRight
+        11: 3.0,  # EyeLookUpRight
+        52: 50.0, # HeadYaw
+        53: 50.0, # HeadPitch
+        54: 50.0, # HeadRoll
     }
-    for ch_idx, gain in EXPR_GAIN.items():
-        arkit[:, ch_idx] = np.clip(arkit[:, ch_idx] * gain, 0.0, 1.0)
+    for ch_idx, gain in CHANNEL_GAIN.items():
+        if ch_idx < 52:
+            arkit[:, ch_idx] = np.clip(arkit[:, ch_idx] * gain, 0.0, 1.0)
+        else:
+            arkit[:, ch_idx] *= gain
 
     curves = arkit_to_mh_curves(arkit)
 
-    # Head rotation curves for the AnimNode path (backward compat)
+    # Head rotation (channels 52-54) — written as curves that the PostProcess
+    # ControlRig's HeadMovementIK system reads directly.
     curves["HeadYaw"]   = arkit[:, 52].tolist()
     curves["HeadPitch"] = arkit[:, 53].tolist()
     curves["HeadRoll"]  = arkit[:, 54].tolist()
+    # Enable the head movement IK system (1.0 = on)
     curves["HeadControlSwitch"] = [1.0] * n_frames
 
-    # Raw ARKit channels for the LiveLink path — all 61 channels with
-    # original Apple ARKit names, UNAMPLIFIED. The MetaHuman LiveLink
-    # AnimBP handles its own scaling (head rot × 50 etc.).
+    # Raw ARKit channels for LiveLink path (unamplified, but smoothed)
     arkit_raw = {}
     for i, name in enumerate(CHANNEL_NAMES):
         arkit_raw[name] = arkit_raw_clean[:, i].tolist()
@@ -225,7 +269,7 @@ def generate(req: GenerateRequest):
     if _model is None:
         raise HTTPException(status_code=503, detail="model not loaded")
     try:
-        result = generate_curves(req.prompt, req.frames, req.fps, req.guidance)
+        result = generate_curves(req.prompt, req.frames, req.fps, req.guidance, req.smooth_window)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"generation failed: {e}")
     print(
