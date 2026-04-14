@@ -20,19 +20,26 @@ from model import TextToFace
 
 
 def load_checkpoint(ckpt_path: Path, device: torch.device) -> tuple[TextToFace, dict]:
-    """Load a training checkpoint and rebuild the model with matching hparams."""
+    """Load a training checkpoint. Uses EMA weights if available (smoother output)."""
     payload = torch.load(ckpt_path, map_location=device, weights_only=False)
     saved_args = payload.get("args", {})
 
+    # v8 architecture defaults — matches train.py
     model = TextToFace(
         max_frames=saved_args.get("max_frames", 240),
-        latent_dim=saved_args.get("latent_dim", 512),
-        n_layers=saved_args.get("n_layers", 4),
-        n_heads=saved_args.get("n_heads", 8),
-        ff_dim=saved_args.get("ff_dim", 1024),
+        latent_dim=saved_args.get("latent_dim", 768),
+        n_layers=saved_args.get("n_layers", 6),
+        n_heads=saved_args.get("n_heads", 12),
+        ff_dim=saved_args.get("ff_dim", 2048),
         dropout=saved_args.get("dropout", 0.25),
     ).to(device)
-    model.load_state_dict(payload["model"])
+
+    # Prefer EMA weights — smoother, what training validates against.
+    # Fall back to raw weights for older checkpoints that didn't save EMA.
+    if "ema_model" in payload:
+        model.load_state_dict(payload["ema_model"])
+    else:
+        model.load_state_dict(payload["model"])
     model.eval()
     return model, saved_args
 
@@ -93,7 +100,12 @@ def main():
                         help="Optional random seed (not used currently but reserved)")
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
+        device = torch.device("mps")  # Apple Silicon GPU
+    else:
+        device = torch.device("cpu")
     print(f"Device: {device}")
 
     ckpt_path = Path(args.ckpt)
