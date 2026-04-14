@@ -105,7 +105,12 @@ _param_count_m: float = 0.0
 def load_model(ckpt_path: str, stats_dir: str) -> None:
     global _model, _mean, _std, _device, _max_frames, _param_count_m
 
-    _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        _device = torch.device("cuda")
+    elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
+        _device = torch.device("mps")  # Apple Silicon GPU
+    else:
+        _device = torch.device("cpu")
     print(f"[server] device: {_device}")
 
     ckpt = Path(ckpt_path)
